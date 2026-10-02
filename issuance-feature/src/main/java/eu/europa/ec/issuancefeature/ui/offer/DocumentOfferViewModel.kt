@@ -26,9 +26,12 @@ import eu.europa.ec.commonfeature.config.OfferCodeUiConfig
 import eu.europa.ec.commonfeature.config.OfferUiConfig
 import eu.europa.ec.commonfeature.config.PresentationMode
 import eu.europa.ec.commonfeature.config.RequestUriConfig
+import eu.europa.ec.commonfeature.ui.request.model.RelyingPartyHeaderUi
 import eu.europa.ec.commonfeature.util.toCardUi
 import eu.europa.ec.corelogic.controller.VeranaTrustController
-import eu.europa.ec.corelogic.controller.VeranaTrustState
+import eu.europa.ec.corelogic.model.IssuerRegistrationDomain
+import eu.europa.ec.corelogic.model.VeranaTrustState
+import eu.europa.ec.corelogic.model.blocksAction
 import eu.europa.ec.eudi.wallet.document.DocumentId
 import eu.europa.ec.issuancefeature.di.getOrCreateCredentialOfferScope
 import eu.europa.ec.issuancefeature.di.getOrNullCredentialOfferScope
@@ -40,8 +43,8 @@ import eu.europa.ec.resourceslogic.R
 import eu.europa.ec.resourceslogic.provider.ResourceProvider
 import eu.europa.ec.uilogic.component.ListItemDataUi
 import eu.europa.ec.uilogic.component.RelyingPartyDataUi
+import eu.europa.ec.uilogic.component.VeranaTrustCardUi
 import eu.europa.ec.uilogic.component.content.ContentErrorConfig
-import eu.europa.ec.uilogic.component.content.ContentHeaderConfig
 import eu.europa.ec.uilogic.config.ConfigNavigation
 import eu.europa.ec.uilogic.config.NavigationType
 import eu.europa.ec.uilogic.mvi.MviViewModel
@@ -65,7 +68,7 @@ data class State(
     val offerUiConfig: OfferUiConfig,
 
     val isLoading: Boolean = true,
-    val headerConfig: ContentHeaderConfig,
+    val relyingPartyHeader: RelyingPartyHeaderUi? = null,
     val error: ContentErrorConfig? = null,
     val isInitialised: Boolean = false,
     val notifyOnAuthenticationFailure: Boolean = false,
@@ -74,11 +77,15 @@ data class State(
     val noDocument: Boolean = false,
     val txCodeLength: Int? = null,
     val veranaTrust: VeranaTrustState? = null,
+    val veranaTrustCard: VeranaTrustCardUi? = null,
 
     val isBottomSheetOpen: Boolean = false,
     val bottomSheetClosingInProgress: Boolean = false,
     val sheetContent: DocumentOfferBottomSheetContent = DocumentOfferBottomSheetContent.IssuerNotTrusted,
-) : ViewState
+) : ViewState {
+    val allowAccept: Boolean
+        get() = !noDocument && !veranaTrust.blocksAction
+}
 
 sealed class Event : ViewEvent {
     data class Init(val deepLink: Uri?) : Event()
@@ -89,6 +96,10 @@ sealed class Event : ViewEvent {
     data object DismissError : Event()
 
     data class StickyButtonPressed(val context: Context) : Event()
+
+    data object PrivacyPolicyLinkClicked : Event()
+
+    data object VeranaTrustRetry : Event()
 
     sealed class BottomSheet : Event() {
         data class UpdateBottomSheetState(val isOpen: Boolean) : BottomSheet()
@@ -115,6 +126,8 @@ sealed class Effect : ViewSideEffect {
             val link: Uri,
             val routeToPop: String? = null
         ) : Navigation()
+
+        data class OpenUrlExternally(val url: Uri) : Navigation()
     }
 
     data object ShowBottomSheet : Effect()
@@ -139,7 +152,7 @@ class DocumentOfferViewModel(
 ) : MviViewModel<Event, State, Effect>() {
 
     private var veranaTrustJob: Job? = null
-    private var veranaCredentialName: String? = null
+    private var veranaTrustRequest: VeranaTrustRequest? = null
 
     private var _documentOfferInteractor: DocumentOfferInteractor? = documentOfferInteractor
 
@@ -158,7 +171,6 @@ class DocumentOfferViewModel(
 
         return State(
             offerUiConfig = deserializedOfferUiConfig,
-            headerConfig = getInitialHeaderConfig()
         )
     }
 
@@ -176,6 +188,7 @@ class DocumentOfferViewModel(
             }
 
             is Event.BackButtonPressed -> {
+                if (viewState.value.bottomSheetClosingInProgress) return
                 setState { copy(error = null) }
                 doNavigation(viewState.value.offerUiConfig.onCancelNavigation)
             }
@@ -185,19 +198,32 @@ class DocumentOfferViewModel(
             }
 
             is Event.StickyButtonPressed -> {
-                if (viewState.value.veranaTrust?.allowAction == false) {
+                if (viewState.value.veranaTrust.blocksAction) {
                     setEffect { Effect.ShowBottomSheet }
                     return
                 }
                 issueDocuments(
                     context = event.context,
                     offerUri = viewState.value.offerUiConfig.offerUri,
-                    issuerName = viewState.value.headerConfig.relyingPartyData?.name.ifEmptyOrNull(
+                    issuerName = viewState.value.relyingPartyHeader?.relyingParty?.name.ifEmptyOrNull(
                         default = resourceProvider.getString(R.string.issuance_document_offer_relying_party_default_name)
                     ),
                     onSuccessNavigation = viewState.value.offerUiConfig.onSuccessNavigation,
                     txCodeLength = viewState.value.txCodeLength
                 )
+            }
+
+            is Event.PrivacyPolicyLinkClicked -> {
+                val privacyPolicyUrl = viewState.value.relyingPartyHeader?.privacyPolicyUrl
+                privacyPolicyUrl?.let { safeUrl ->
+                    setEffect {
+                        Effect.Navigation.OpenUrlExternally(url = safeUrl.toUri())
+                    }
+                }
+            }
+
+            is Event.VeranaTrustRetry -> {
+                veranaTrustRequest?.let(::collectVeranaTrust)
             }
 
             is Event.OnPause -> {
@@ -307,10 +333,16 @@ class DocumentOfferViewModel(
                                 error = null
                             )
                         }
-                        setEffect { Effect.ShowBottomSheet }
+                        showBottomSheet(sheetContent = DocumentOfferBottomSheetContent.IssuerNotTrusted)
                     }
 
                     is ResolveDocumentOfferInteractorPartialState.Success -> {
+                        val relyingPartyHeader = buildRelyingPartyHeader(
+                            issuerName = response.issuerName,
+                            issuerLogo = response.issuerLogo,
+                            issuerRegistration = response.issuerRegistration,
+                        )
+
                         setState {
                             copy(
                                 isLoading = false,
@@ -319,27 +351,31 @@ class DocumentOfferViewModel(
                                 isInitialised = true,
                                 noDocument = false,
                                 txCodeLength = response.txCodeLength,
-                                veranaTrust = VeranaTrustState.resolving,
-                                headerConfig = headerConfig.copy(
-                                    relyingPartyData = getHeaderConfigIssuerData(
-                                        issuerName = response.issuerName,
-                                        issuerLogo = response.issuerLogo,
-                                    ),
-                                    veranaTrustCard = VeranaTrustState.resolving.toCardUi(credentialName = veranaCredentialName),
-                                ),
+                                relyingPartyHeader = relyingPartyHeader,
                             )
                         }
 
-                        veranaCredentialName = response.documents.firstOrNull()?.title
-                        collectVeranaTrust(
-                            issuerUrl = response.veranaIssuerUrl,
-                            vct = response.veranaVct,
-                        )
+                        response.veranaIssuerUrl?.let { issuerUrl ->
+                            collectVeranaTrust(
+                                VeranaTrustRequest(
+                                    issuerUrl = issuerUrl,
+                                    vct = response.veranaVct,
+                                    partyName = response.issuerName,
+                                    credentialName = response.documents.firstOrNull()?.title,
+                                )
+                            )
+                        }
 
                         handleDeepLink(deepLink)
                     }
 
                     is ResolveDocumentOfferInteractorPartialState.NoDocument -> {
+                        val relyingPartyHeader = buildRelyingPartyHeader(
+                            issuerName = response.issuerName,
+                            issuerLogo = response.issuerLogo,
+                            issuerRegistration = response.issuerRegistration,
+                        )
+
                         setState {
                             copy(
                                 isLoading = false,
@@ -347,12 +383,7 @@ class DocumentOfferViewModel(
                                 documents = emptyList(),
                                 isInitialised = true,
                                 noDocument = true,
-                                headerConfig = headerConfig.copy(
-                                    relyingPartyData = getHeaderConfigIssuerData(
-                                        issuerName = response.issuerName,
-                                        issuerLogo = response.issuerLogo,
-                                    )
-                                ),
+                                relyingPartyHeader = relyingPartyHeader,
                             )
                         }
                     }
@@ -361,27 +392,17 @@ class DocumentOfferViewModel(
         }
     }
 
-    private fun collectVeranaTrust(issuerUrl: String?, vct: String?) {
+    private fun collectVeranaTrust(request: VeranaTrustRequest) {
+        veranaTrustRequest = request
         veranaTrustJob?.cancel()
-        if (issuerUrl == null) {
-            val unverified = VeranaTrustState.unverified()
-            setState {
-                copy(
-                    veranaTrust = unverified,
-                    headerConfig = headerConfig.copy(
-                        veranaTrustCard = unverified.toCardUi(credentialName = veranaCredentialName),
-                    ),
-                )
-            }
-            return
-        }
         veranaTrustJob = viewModelScope.launch {
-            veranaTrustController.issuerTrust(issuerUrl, vct).collect { trust ->
+            veranaTrustController.issuerTrust(request.issuerUrl, request.vct).collect { trust ->
                 setState {
                     copy(
                         veranaTrust = trust,
-                        headerConfig = headerConfig.copy(
-                            veranaTrustCard = trust.toCardUi(credentialName = veranaCredentialName),
+                        veranaTrustCard = trust.toCardUi(
+                            partyName = request.partyName,
+                            credentialName = request.credentialName,
                         ),
                     )
                 }
@@ -389,27 +410,34 @@ class DocumentOfferViewModel(
         }
     }
 
-    private fun getInitialHeaderConfig(): ContentHeaderConfig {
-        return ContentHeaderConfig(
-            description = resourceProvider.getString(R.string.issuance_document_offer_description),
-            mainText = resourceProvider.getString(R.string.issuance_document_offer_header_main_text),
-            relyingPartyData = RelyingPartyDataUi(
-                isVerified = false,
-                name = resourceProvider.getString(R.string.issuance_document_offer_relying_party_default_name),
-                description = resourceProvider.getString(R.string.issuance_document_offer_relying_party_description)
-            )
-        )
-    }
-
-    private fun getHeaderConfigIssuerData(
+    /**
+     * The provider identity block: name and logo come from the resolved offer, the badge and the
+     * registration sections from the registration-certificate evaluation. Only a verified
+     * registration renders details.
+     */
+    private fun buildRelyingPartyHeader(
         issuerName: String,
         issuerLogo: URI?,
-    ): RelyingPartyDataUi {
-        return RelyingPartyDataUi(
-            logo = issuerLogo,
-            isVerified = false,
-            name = issuerName,
-            description = resourceProvider.getString(R.string.issuance_document_offer_relying_party_description)
+        issuerRegistration: IssuerRegistrationDomain,
+    ): RelyingPartyHeaderUi {
+        val details = when (issuerRegistration) {
+            is IssuerRegistrationDomain.Verified -> issuerRegistration.details
+
+            is IssuerRegistrationDomain.Blocked,
+            is IssuerRegistrationDomain.NotVerified,
+            is IssuerRegistrationDomain.NotEvaluated -> null
+        }
+
+        return RelyingPartyHeaderUi(
+            relyingParty = RelyingPartyDataUi(
+                logo = issuerLogo,
+                isVerified = issuerRegistration is IssuerRegistrationDomain.Verified,
+                name = issuerName,
+                uniqueId = details?.uniqueId,
+                description = null,
+            ),
+            intendedUse = details?.intendedUse,
+            privacyPolicyUrl = details?.privacyPolicyUrl,
         )
     }
 
@@ -461,24 +489,24 @@ class DocumentOfferViewModel(
                         setState {
                             copy(
                                 isLoading = false,
-                                error = null,
-                                sheetContent = DocumentOfferBottomSheetContent.IssuerNotTrusted
+                                error = null
                             )
                         }
-                        setEffect { Effect.ShowBottomSheet }
+                        showBottomSheet(sheetContent = DocumentOfferBottomSheetContent.IssuerNotTrusted)
                     }
 
                     is IssueDocumentsInteractorPartialState.PartialSuccessWithUntrustedIssuer -> {
                         setState {
                             copy(
                                 isLoading = false,
-                                error = null,
-                                sheetContent = DocumentOfferBottomSheetContent.PartialSuccessWithUntrustedIssuer(
-                                    issuedDocumentIds = response.issuedDocumentIds
-                                )
+                                error = null
                             )
                         }
-                        setEffect { Effect.ShowBottomSheet }
+                        showBottomSheet(
+                            sheetContent = DocumentOfferBottomSheetContent.PartialSuccessWithUntrustedIssuer(
+                                issuedDocumentIds = response.issuedDocumentIds
+                            )
+                        )
                     }
 
                     is IssueDocumentsInteractorPartialState.Success -> {
@@ -521,7 +549,6 @@ class DocumentOfferViewModel(
 
     override fun onCleared() {
         getOrNullCredentialOfferScope()?.close()
-        super.onCleared()
     }
 
     private fun goToDocumentIssuanceSuccessScreen(
@@ -649,9 +676,25 @@ class DocumentOfferViewModel(
         }
     }
 
+    private fun showBottomSheet(sheetContent: DocumentOfferBottomSheetContent) {
+        setState {
+            copy(sheetContent = sheetContent)
+        }
+        setEffect {
+            Effect.ShowBottomSheet
+        }
+    }
+
     private fun hideBottomSheet() {
         setEffect {
             Effect.CloseBottomSheet
         }
     }
 }
+
+private data class VeranaTrustRequest(
+    val issuerUrl: String,
+    val vct: String?,
+    val partyName: String?,
+    val credentialName: String?,
+)

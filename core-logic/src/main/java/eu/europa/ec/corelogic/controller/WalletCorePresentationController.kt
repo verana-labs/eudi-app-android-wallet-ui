@@ -25,11 +25,17 @@ import eu.europa.ec.businesslogic.extension.toUri
 import eu.europa.ec.corelogic.di.WalletCoreScope
 import eu.europa.ec.corelogic.di.getOrCreateKoinScope
 import eu.europa.ec.corelogic.extension.toClaimPath
+import eu.europa.ec.corelogic.extension.toRegistrationStatusDomain
 import eu.europa.ec.corelogic.model.AuthenticationData
 import eu.europa.ec.corelogic.model.PresentationCombinationDomain
 import eu.europa.ec.corelogic.model.PresentationMatchDomain
 import eu.europa.ec.corelogic.model.PresentationSelectionDomain
+import eu.europa.ec.corelogic.model.RegistrationStatusDomain
+import eu.europa.ec.corelogic.model.RelyingPartyDomain
+import eu.europa.ec.corelogic.model.blocksAction
 import eu.europa.ec.corelogic.model.identityKey
+import eu.europa.ec.corelogic.model.requesterUniqueIdOrNull
+import eu.europa.ec.corelogic.model.resolveRequesterName
 import eu.europa.ec.corelogic.util.EudiWalletListenerWrapper
 import eu.europa.ec.eudi.iso18013.transfer.TransferEvent
 import eu.europa.ec.eudi.iso18013.transfer.response.RequestProcessor
@@ -57,6 +63,7 @@ import kotlinx.coroutines.flow.merge
 import kotlinx.coroutines.flow.shareIn
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.runBlocking
+import org.multipaz.presentment.CredentialMatchSourceOpenID4VP
 import org.multipaz.presentment.CredentialPresentmentSelection
 import org.multipaz.presentment.CredentialPresentmentSetOptionMemberMatch
 import org.multipaz.securearea.KeyUnlockData
@@ -81,9 +88,9 @@ sealed class TransferEventPartialState {
     data class QrEngagementReady(val qrCode: String) : TransferEventPartialState()
     data class RequestReceived(
         val combinationsDomain: List<PresentationCombinationDomain>,
-        val verifierName: String?,
-        val verifierIsTrusted: Boolean,
+        val relyingParty: RelyingPartyDomain,
         val veranaCertificates: List<X509Certificate> = emptyList(),
+        val veranaVct: String? = null,
     ) : TransferEventPartialState()
 
     data object VerifierNotTrusted : TransferEventPartialState()
@@ -152,7 +159,7 @@ interface WalletCorePresentationController {
      * */
     val verifierName: String?
 
-    val verifierIsTrusted: Boolean?
+    val verifierIsFullyVerified: Boolean?
 
     /**
      * Indicates whether the received request permits per-claim disclosure.
@@ -273,7 +280,7 @@ class WalletCorePresentationControllerImpl(
 
     override var verifierName: String? = null
 
-    override var verifierIsTrusted: Boolean? = null
+    override var verifierIsFullyVerified: Boolean? = null
 
     override val requestAllowsClaimSelection: Boolean
         get() = processedRequest?.let {
@@ -429,11 +436,8 @@ class WalletCorePresentationControllerImpl(
     }
 
     override suspend fun sendRequestedDocuments(): SendRequestedDocumentsPartialState {
-        // The Verana verdict gates the wire send, not just the consent screen: a remembered or
-        // re-entered flow that skips the dialog must still be unable to disclose. OpenID4VP only;
-        // proximity and DC-API carry no verdict.
         if (runCatching { requireConfig() }.getOrNull() is PresentationControllerConfig.OpenId4VP &&
-            veranaTrustController?.latestVerifierState?.value?.allowAction == false
+            veranaTrustController?.latestVerifierState?.value.blocksAction
         ) {
             return SendRequestedDocumentsPartialState.Failure(
                 error = "The Verana public registry does not vouch for this verifier."
@@ -600,13 +604,14 @@ class WalletCorePresentationControllerImpl(
             val success = result.getOrThrow()
             processedRequest = success
 
-            // unverified mdoc readers (BLE, DC-API) arrive with null trustMetadata and still reach
-            // consent; disclosure is refused later by the reader-auth policy. untrusted OpenID4VP
-            // never reaches this success path (rejected at resolution; see getOrElse / onError)
-            val trustMetadata = success.trustMetadata
-            verifierName = trustMetadata?.displayName
-            val isTrusted = trustMetadata != null
-            verifierIsTrusted = isTrusted
+            // mdoc readers that fail or skip reader auth reach consent with no trusted access
+            // certificate; disclosure is refused later by the reader-auth policy. untrusted
+            // OpenID4VP never reaches this success path (rejected at resolution; see getOrElse /
+            // onError). both identity values are taken off the object built here — derived once,
+            // read by every later screen
+            val relyingParty = buildRelyingParty(request = success)
+            verifierName = relyingParty.name
+            verifierIsFullyVerified = relyingParty.isFullyVerified
 
             val combinationsDomain = success.buildCombinationsDomain()
 
@@ -623,16 +628,16 @@ class WalletCorePresentationControllerImpl(
 
             TransferEventPartialState.RequestReceived(
                 combinationsDomain = combinationsDomain,
-                verifierName = verifierName,
-                verifierIsTrusted = isTrusted,
+                relyingParty = relyingParty,
                 veranaCertificates = veranaCertificates,
+                veranaVct = success.requestedVct(),
             )
         }.getOrElse { throwable ->
             // OpenID4VP over the DC-API delivers the untrusted-verifier rejection as a
             // ProcessedRequest.Failure, which getOrThrow() surfaces here
             if (throwable.isUntrustedVerifierRejection()) {
                 verifierName = null
-                verifierIsTrusted = false
+                verifierIsFullyVerified = false
                 TransferEventPartialState.VerifierNotTrusted
             } else {
                 TransferEventPartialState.Error(
@@ -640,6 +645,34 @@ class WalletCorePresentationControllerImpl(
                 )
             }
         }
+    }
+
+    /**
+     * Both trust layers of the received request, projected into the domain — transport-blind:
+     *
+     * - the registration outcome comes straight from the Wallet Core evaluation attached to the
+     *   request; one that carried no evaluation lands on [RegistrationStatusDomain.NotEvaluated].
+     * - trust metadata is Wallet Core's uniform access-certificate verdict across every transport
+     *   (OpenID4VP, proximity, both DC-API protocols): non-null only when the chain validated
+     *   against the configured trust source. Its display name is the verifier's legal name on
+     *   OpenID4VP and the reader certificate's CN on the mdoc transports.
+     */
+    private fun buildRelyingParty(
+        request: RequestProcessor.ProcessedRequest.Success,
+    ): RelyingPartyDomain {
+        val trustMetadata = request.trustMetadata
+        val registration = request.wrpRegistration
+            .toRegistrationStatusDomain(locale = resourceProvider.getLocale())
+
+        return RelyingPartyDomain(
+            name = registration.resolveRequesterName(
+                accessCertificateName = trustMetadata?.displayName,
+            ),
+            uniqueId = registration.requesterUniqueIdOrNull(),
+            hasTrustedAccessCertificate = trustMetadata != null,
+            logoUri = null,
+            registration = registration,
+        )
     }
 
     private fun addListener(listener: TransferEvent.Listener) {
@@ -682,6 +715,13 @@ private fun Throwable.isUntrustedVerifierRejection(): Boolean {
     // dedicated untrusted-verifier error instead of an implementation-only openid4vp exception
     return toString().contains(other = "Untrusted x5c", ignoreCase = true)
 }
+
+private fun RequestProcessor.ProcessedRequest.Success.requestedVct(): String? =
+    presentmentSelections
+        .flatMap { selection -> selection.matches }
+        .flatMap { match -> (match.source as? CredentialMatchSourceOpenID4VP)?.credentialQuery?.vctValues.orEmpty() }
+        .distinct()
+        .singleOrNull()
 
 private fun RequestProcessor.ProcessedRequest.Success.buildCombinationsDomain(): List<PresentationCombinationDomain> {
     return presentmentSelections.map { selection ->

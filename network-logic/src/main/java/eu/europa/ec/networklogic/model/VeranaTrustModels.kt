@@ -1,80 +1,124 @@
-/*
- * Copyright (c) 2026 European Commission
- *
- * Licensed under the EUPL, Version 1.2 or - as soon they will be approved by the European
- * Commission - subsequent versions of the EUPL (the "Licence"); You may not use this work
- * except in compliance with the Licence.
- *
- * You may obtain a copy of the Licence at:
- * https://joinup.ec.europa.eu/software/page/eupl
- *
- * Unless required by applicable law or agreed to in writing, software distributed under
- * the Licence is distributed on an "AS IS" basis, WITHOUT WARRANTIES OR CONDITIONS OF
- * ANY KIND, either express or implied. See the Licence for the specific language
- * governing permissions and limitations under the Licence.
- */
-
 package eu.europa.ec.networklogic.model
 
-import kotlinx.serialization.SerialName
-import kotlinx.serialization.Serializable
 import kotlinx.serialization.json.JsonObject
 
-@Serializable
-data class VeranaTrustCredential(
-    val ecsType: String? = null,
-    val result: String? = null,
-    val format: String? = null,
-    val issuedBy: String? = null,
-    val claims: JsonObject? = null,
-) {
-    val isValid: Boolean get() = result == "VALID"
+data class VeranaNetwork(
+    val id: String,
+    val name: String,
+    val indexerUrl: String,
+    val explorerUrl: String? = null,
+    val production: Boolean,
+    val trustedEcsEcosystemDids: List<String>? = null,
+)
+
+val VERANA_NETWORKS = listOf(
+    VeranaNetwork(
+        id = "vna-devnet-1",
+        name = "Devnet",
+        indexerUrl = "https://idx.devnet.verana.network",
+        explorerUrl = "https://explorer.devnet.verana.network",
+        production = false,
+    ),
+    VeranaNetwork(
+        id = "vna-testnet-1",
+        name = "Testnet",
+        indexerUrl = "https://idx.testnet.verana.network",
+        explorerUrl = "https://explorer.testnet.verana.network",
+        production = false,
+    ),
+)
+
+fun List<VeranaNetwork>.networkLabel(): String? = filterNot { it.production }
+    .joinToString(separator = " · ") { it.name.uppercase() }
+    .ifEmpty { null }
+
+enum class VeranaTrustRole {
+    ISSUER,
+    VERIFIER,
 }
 
-@Serializable
+enum class VeranaTrustStatus {
+    TRUSTED,
+    UNTRUSTED,
+    UNVERIFIED,
+}
+
+enum class VeranaUntrustedReason {
+    NO_DID_DOCUMENT,
+    NOT_REGISTERED,
+    NOT_TRUSTED,
+    ECOSYSTEM_NOT_TRUSTED,
+    DID_NOT_PROVEN,
+}
+
+data class VeranaTrustClaim(
+    val name: String,
+    val values: List<String>,
+    val safeHttpUrl: String? = null,
+)
+
+data class VeranaTrustCredential(
+    val ecsSchema: String,
+    val ecosystemId: Long? = null,
+    val id: String? = null,
+    val claims: List<VeranaTrustClaim>,
+)
+
 data class VeranaTrustResolution(
     val did: String,
-    val trustStatus: String,
-    val production: Boolean,
+    val status: VeranaTrustStatus,
+    val reason: VeranaUntrustedReason? = null,
+    val network: VeranaNetwork? = null,
     val evaluatedAt: String? = null,
-    val evaluatedAtBlock: Long? = null,
     val expiresAt: String? = null,
-    val credentials: List<VeranaTrustCredential>? = null,
-)
+    val credentials: List<VeranaTrustCredential> = emptyList(),
+    val unresolvableCredentialIds: List<String> = emptyList(),
+) {
+    companion object {
+        fun unresolved(
+            did: String,
+            status: VeranaTrustStatus,
+            reason: VeranaUntrustedReason? = null,
+            network: VeranaNetwork? = null,
+        ) = VeranaTrustResolution(
+            did = did,
+            status = status,
+            reason = reason,
+            network = network,
+        )
+    }
+}
 
-@Serializable
-data class VeranaPermission(
-    val id: String? = null,
-    val did: String? = null,
-    @SerialName("schema_id") val schemaId: String? = null,
-    val type: String? = null,
-    @SerialName("effective_from") val effectiveFrom: String? = null,
-    @SerialName("effective_until") val effectiveUntil: String? = null,
-    val revoked: String? = null,
-    val slashed: String? = null,
-    @SerialName("vp_state") val validationState: String? = null,
-)
+sealed interface VeranaIndexerAnswer {
+    data class Resolved(val resolution: VeranaTrustResolution) : VeranaIndexerAnswer
+    data object NotRegistered : VeranaIndexerAnswer
+    data object Unanswered : VeranaIndexerAnswer
+}
 
-data class VeranaSchema(
+data class VeranaVerificationMethod(
     val id: String,
-    val trustRegistryId: String?,
-    val title: String?,
-    val vprId: String?,
+    val type: String?,
+    val publicKeyJwk: JsonObject?,
+    val publicKeyMultibase: String?,
 )
 
-data class VeranaAccreditation(
-    val role: VeranaRole,
-    val granted: Boolean,
-    val schemaId: String? = null,
-    val permissionId: String? = null,
-    val reason: String? = null,
+data class VeranaDidDocument(
+    val id: String,
+    val assertionMethods: List<VeranaVerificationMethod>,
+    val authenticationMethods: List<VeranaVerificationMethod>,
 )
 
-enum class VeranaRole { ISSUER, VERIFIER }
+data class VeranaSchemaRef(
+    val network: VeranaNetwork,
+    val schemaId: String,
+) {
+    companion object {
+        private val SCHEMA_REF = Regex("""^vpr:verana:([^:]+):cs:(\d+)$""")
 
-data class SignedIssuerMetadata(
-    val kid: String,
-    val did: String,
-    val payload: JsonObject,
-    val signatureVerified: Boolean,
-)
+        fun parse(ref: String?, networks: List<VeranaNetwork>): VeranaSchemaRef? {
+            val match = ref?.let(SCHEMA_REF::matchEntire) ?: return null
+            return networks.firstOrNull { it.id == match.groupValues[1] }
+                ?.let { network -> VeranaSchemaRef(network = network, schemaId = match.groupValues[2]) }
+        }
+    }
+}

@@ -16,13 +16,18 @@
 
 package eu.europa.ec.commonfeature.ui.request
 
+import android.net.Uri
+import eu.europa.ec.businesslogic.extension.toUri
+import eu.europa.ec.commonfeature.ui.request.model.RegistrationWarningUi
+import eu.europa.ec.commonfeature.ui.request.model.RelyingPartyHeaderUi
 import eu.europa.ec.commonfeature.ui.request.model.RequestDataUi
 import eu.europa.ec.commonfeature.ui.request.model.RequestDocumentItemUi
-import eu.europa.ec.corelogic.controller.VeranaTrustState
+import eu.europa.ec.corelogic.model.VeranaTrustState
+import eu.europa.ec.corelogic.model.blocksAction
 import eu.europa.ec.uilogic.component.AppIcons
 import eu.europa.ec.uilogic.component.ListItemTrailingContentDataUi
+import eu.europa.ec.uilogic.component.VeranaTrustCardUi
 import eu.europa.ec.uilogic.component.content.ContentErrorConfig
-import eu.europa.ec.uilogic.component.content.ContentHeaderConfig
 import eu.europa.ec.uilogic.component.wrap.ExpandableListItemUi
 import eu.europa.ec.uilogic.config.NavigationType
 import eu.europa.ec.uilogic.extension.toggleCheckboxState
@@ -37,11 +42,12 @@ import kotlinx.coroutines.Job
 
 data class State(
     val isLoading: Boolean = true,
-    val headerConfig: ContentHeaderConfig,
+    val relyingPartyHeader: RelyingPartyHeaderUi? = null,
+    val registrationWarning: RegistrationWarningUi? = null,
     val error: ContentErrorConfig? = null,
     val isBottomSheetOpen: Boolean = false,
     val bottomSheetClosingInProgress: Boolean = false,
-    val sheetContent: RequestBottomSheetContent = RequestBottomSheetContent.WARNING,
+    val sheetContent: RequestBottomSheetContent = RequestBottomSheetContent.Warning,
     val hasWarnedUser: Boolean = false,
     val presentationScopeId: String = "",
 
@@ -50,14 +56,20 @@ data class State(
 
     val intentAction: IntentAction? = null,
 
-    // Null on flows that carry no Verana verdict (proximity, DC-API); those stay ungated.
     val veranaTrust: VeranaTrustState? = null,
+    val veranaTrustCard: VeranaTrustCardUi? = null,
 ) : ViewState {
     val allowShare: Boolean
-        get() = veranaTrust?.allowAction != false && if (claimsAreSelectable) {
-            requestDataUi.selectedDocuments.anyClaimChecked()
-        } else {
-            requestDataUi.selectedDocuments.isNotEmpty()
+        get() {
+            val claimsSatisfied = if (claimsAreSelectable) {
+                requestDataUi.selectedDocuments.anyClaimChecked()
+            } else {
+                requestDataUi.selectedDocuments.isNotEmpty()
+            }
+
+            // a shown warning banner gates Share until its switch is flipped
+            val riskAcknowledged = registrationWarning?.riskAccepted != false
+            return claimsSatisfied && riskAcknowledged && !veranaTrust.blocksAction
         }
 }
 
@@ -72,6 +84,12 @@ sealed class Event : ViewEvent {
     data class ExpandOrCollapseRequestDocumentItem(val itemId: String) : Event()
 
     data class CombinationSelected(val index: Int) : Event()
+
+    data object PrivacyPolicyLinkClicked : Event()
+
+    data class RegistrationRiskToggled(val isAccepted: Boolean) : Event()
+
+    data object VeranaTrustRetry : Event()
 
     sealed class BottomSheet : Event() {
         data class UpdateBottomSheetState(val isOpen: Boolean) : BottomSheet()
@@ -93,25 +111,28 @@ sealed class Effect : ViewSideEffect {
         data class PopTo(
             val screenRoute: String,
         ) : Navigation()
+
+        data class OpenUrlExternally(val url: Uri) : Navigation()
     }
 
     data object ShowBottomSheet : Effect()
     data object CloseBottomSheet : Effect()
 }
 
-enum class RequestBottomSheetContent {
-    WARNING,
-    VERIFIER_NOT_TRUSTED,
+sealed class RequestBottomSheetContent {
+    data object Warning : RequestBottomSheetContent()
+    data object VerifierNotTrusted : RequestBottomSheetContent()
 }
 
 abstract class RequestViewModel : MviViewModel<Event, State, Effect>() {
     protected var viewModelJob: Job? = null
 
-    abstract fun getHeaderConfig(): ContentHeaderConfig
     abstract fun getNextScreen(): String
     abstract fun doWork()
 
     open fun init(intentAction: IntentAction?) {}
+
+    open fun retryVeranaTrust() {}
 
     /**
      * Called during [NavigationType.Pop].
@@ -126,7 +147,6 @@ abstract class RequestViewModel : MviViewModel<Event, State, Effect>() {
 
     override fun setInitialState(): State {
         return State(
-            headerConfig = getHeaderConfig(),
             error = null,
         )
     }
@@ -147,12 +167,13 @@ abstract class RequestViewModel : MviViewModel<Event, State, Effect>() {
             }
 
             is Event.OnBack -> {
+                if (viewState.value.bottomSheetClosingInProgress) return
                 handleOnBack()
             }
 
             is Event.StickyButtonPressed -> {
-                if (viewState.value.veranaTrust?.allowAction == false) {
-                    showBottomSheet(sheetContent = RequestBottomSheetContent.VERIFIER_NOT_TRUSTED)
+                if (viewState.value.veranaTrust.blocksAction) {
+                    showBottomSheet(sheetContent = RequestBottomSheetContent.VerifierNotTrusted)
                 } else {
                     doNavigation(NavigationType.PushRoute(getNextScreen()))
                 }
@@ -167,7 +188,7 @@ abstract class RequestViewModel : MviViewModel<Event, State, Effect>() {
                     setState {
                         copy(hasWarnedUser = true)
                     }
-                    showBottomSheet(sheetContent = RequestBottomSheetContent.WARNING)
+                    showBottomSheet(sheetContent = RequestBottomSheetContent.Warning)
                 }
             }
 
@@ -178,6 +199,27 @@ abstract class RequestViewModel : MviViewModel<Event, State, Effect>() {
             is Event.CombinationSelected -> {
                 selectCombination(index = event.index)
             }
+
+            is Event.PrivacyPolicyLinkClicked -> {
+                val privacyPolicyUrl = viewState.value.relyingPartyHeader?.privacyPolicyUrl
+                privacyPolicyUrl?.let { safeUrl ->
+                    setEffect {
+                        Effect.Navigation.OpenUrlExternally(url = safeUrl.toUri())
+                    }
+                }
+            }
+
+            is Event.RegistrationRiskToggled -> {
+                setState {
+                    copy(
+                        registrationWarning = registrationWarning?.copy(
+                            riskAccepted = event.isAccepted,
+                        ),
+                    )
+                }
+            }
+
+            is Event.VeranaTrustRetry -> retryVeranaTrust()
 
             is Event.BottomSheet.UpdateBottomSheetState -> {
                 setState {
@@ -191,9 +233,9 @@ abstract class RequestViewModel : MviViewModel<Event, State, Effect>() {
 
             is Event.BottomSheet.FinishedClosing -> {
                 when (viewState.value.sheetContent) {
-                    RequestBottomSheetContent.WARNING -> Unit
-                    RequestBottomSheetContent.VERIFIER_NOT_TRUSTED -> {
-                        setEvent(Event.OnBack)
+                    is RequestBottomSheetContent.Warning -> Unit
+                    is RequestBottomSheetContent.VerifierNotTrusted -> {
+                        handleOnBack()
                     }
                 }
             }
@@ -339,7 +381,6 @@ abstract class RequestViewModel : MviViewModel<Event, State, Effect>() {
     }
 
     override fun onCleared() {
-        super.onCleared()
         unsubscribe()
         cleanUp()
     }

@@ -17,28 +17,27 @@
 package eu.europa.ec.presentationfeature.ui.request
 
 import androidx.lifecycle.viewModelScope
-import eu.europa.ec.businesslogic.extension.ifEmptyOrNull
 import eu.europa.ec.commonfeature.config.BiometricMode
 import eu.europa.ec.commonfeature.config.BiometricUiConfig
 import eu.europa.ec.commonfeature.config.OnBackNavigationConfig
+import eu.europa.ec.commonfeature.config.PresentationMode
 import eu.europa.ec.commonfeature.config.RequestUriConfig
 import eu.europa.ec.commonfeature.ui.request.Event
 import eu.europa.ec.commonfeature.ui.request.RequestBottomSheetContent
 import eu.europa.ec.commonfeature.ui.request.RequestViewModel
 import eu.europa.ec.commonfeature.ui.request.model.RequestDataUi
 import eu.europa.ec.commonfeature.ui.request.model.RequestDocumentItemUi
+import eu.europa.ec.commonfeature.ui.request.model.toRegistrationWarningUi
+import eu.europa.ec.commonfeature.ui.request.model.toRelyingPartyHeaderUi
 import eu.europa.ec.commonfeature.util.toCardUi
 import eu.europa.ec.corelogic.controller.VeranaTrustController
-import eu.europa.ec.corelogic.controller.VeranaTrustState
-import eu.europa.ec.corelogic.controller.VeranaVerdict
 import eu.europa.ec.corelogic.di.getOrNullKoinScope
+import eu.europa.ec.corelogic.model.blocksAction
 import eu.europa.ec.presentationfeature.interactor.PresentationRequestInteractor
 import eu.europa.ec.presentationfeature.interactor.PresentationRequestInteractorPartialState
 import eu.europa.ec.resourceslogic.R
 import eu.europa.ec.resourceslogic.provider.ResourceProvider
-import eu.europa.ec.uilogic.component.RelyingPartyDataUi
 import eu.europa.ec.uilogic.component.content.ContentErrorConfig
-import eu.europa.ec.uilogic.component.content.ContentHeaderConfig
 import eu.europa.ec.uilogic.config.ConfigNavigation
 import eu.europa.ec.uilogic.config.NavigationType
 import eu.europa.ec.uilogic.navigation.CommonScreens
@@ -47,11 +46,11 @@ import eu.europa.ec.uilogic.navigation.helper.IntentAction
 import eu.europa.ec.uilogic.navigation.helper.generateComposableArguments
 import eu.europa.ec.uilogic.navigation.helper.generateComposableNavigationLink
 import eu.europa.ec.uilogic.serializer.UiSerializer
-import java.security.cert.X509Certificate
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.launch
 import org.koin.core.annotation.InjectedParam
 import org.koin.core.annotation.KoinViewModel
+import java.security.cert.X509Certificate
 
 @KoinViewModel
 class PresentationRequestViewModel(
@@ -63,18 +62,7 @@ class PresentationRequestViewModel(
 ) : RequestViewModel() {
 
     private var veranaTrustJob: Job? = null
-    private var veranaCredentialName: String? = null
-
-    override fun getHeaderConfig(): ContentHeaderConfig {
-        return ContentHeaderConfig(
-            description = resourceProvider.getString(R.string.request_header_description),
-            mainText = resourceProvider.getString(R.string.request_header_main_text),
-            relyingPartyData = getRelyingPartyData(
-                name = null,
-                isVerified = false,
-            ),
-        )
-    }
+    private var veranaTrustRequest: VeranaTrustRequest? = null
 
     override fun getNextScreen(): String {
         return generateComposableNavigationLink(
@@ -117,6 +105,19 @@ class PresentationRequestViewModel(
             RequestUriConfig.Parser
         ) ?: throw RuntimeException("RequestUriConfig:: is Missing or invalid")
 
+        if (requestUriConfig.mode is PresentationMode.DcApi && intentAction == null) {
+            setState {
+                copy(
+                    isLoading = false,
+                    error = ContentErrorConfig(
+                        errorSubTitle = resourceProvider.genericErrorMessage(),
+                        onCancel = { setEvent(Event.OnBack) }
+                    )
+                )
+            }
+            return
+        }
+
         setState {
             copy(
                 presentationScopeId = requestUriConfig.presentationScopeId,
@@ -157,32 +158,30 @@ class PresentationRequestViewModel(
                     is PresentationRequestInteractorPartialState.Success -> {
                         val requestData = RequestDataUi.of(combinations = response.combinationsUi)
 
-                        val updatedHeaderConfig = viewState.value.headerConfig.copy(
-                            relyingPartyData = getRelyingPartyData(
-                                name = response.verifierName,
-                                isVerified = response.verifierIsTrusted,
-                            )
+                        val relyingPartyHeader = response.relyingParty.toRelyingPartyHeaderUi(
+                            fallbackName = resourceProvider.getString(R.string.request_relying_party_default_name)
                         )
+                        val registrationWarning = response.relyingParty.toRegistrationWarningUi()
 
                         setState {
                             copy(
                                 isLoading = false,
                                 error = null,
-                                headerConfig = updatedHeaderConfig.copy(
-                                    veranaTrustCard = VeranaTrustState.resolving.toCardUi(asksFor = true, credentialName = veranaCredentialName),
-                                ),
+                                relyingPartyHeader = relyingPartyHeader,
+                                registrationWarning = registrationWarning,
                                 requestDataUi = requestData,
                                 claimsAreSelectable = response.claimsAreSelectable,
-                                veranaTrust = VeranaTrustState.resolving,
                             )
                         }
 
-                        veranaCredentialName = requestData.selectedDocuments
-                            .firstOrNull()
-                            ?.let { it.domainPayload.docName }
                         collectVeranaTrust(
-                            certificates = response.veranaCertificates,
-                            vct = response.veranaVct,
+                            VeranaTrustRequest(
+                                certificates = response.veranaCertificates,
+                                vct = response.veranaVct,
+                                partyName = response.relyingParty.name,
+                                credentialName = requestData.selectedDocuments.firstOrNull()?.domainPayload?.docName,
+                                relyingPartyIsFullyVerified = response.relyingParty.isFullyVerified,
+                            )
                         )
 
                         updateData(updatedItems = requestData.selectedDocuments)
@@ -196,7 +195,7 @@ class PresentationRequestViewModel(
                                 error = null
                             )
                         }
-                        showBottomSheet(sheetContent = RequestBottomSheetContent.VERIFIER_NOT_TRUSTED)
+                        showBottomSheet(sheetContent = RequestBottomSheetContent.VerifierNotTrusted)
                     }
 
                     is PresentationRequestInteractorPartialState.Disconnect -> {
@@ -204,28 +203,28 @@ class PresentationRequestViewModel(
                     }
 
                     is PresentationRequestInteractorPartialState.NoData -> {
-                        val updatedHeaderConfig = viewState.value.headerConfig.copy(
-                            relyingPartyData = getRelyingPartyData(
-                                name = response.verifierName,
-                                isVerified = response.verifierIsTrusted,
-                            )
+                        val relyingPartyHeader = response.relyingParty.toRelyingPartyHeaderUi(
+                            fallbackName = resourceProvider.getString(R.string.request_relying_party_default_name)
                         )
 
                         setState {
                             copy(
                                 isLoading = false,
                                 error = null,
-                                headerConfig = updatedHeaderConfig.copy(
-                                    veranaTrustCard = VeranaTrustState.resolving.toCardUi(asksFor = true, credentialName = veranaCredentialName),
-                                ),
+                                relyingPartyHeader = relyingPartyHeader,
+                                registrationWarning = null,
                                 requestDataUi = RequestDataUi.NoData,
-                                veranaTrust = VeranaTrustState.resolving,
                             )
                         }
 
                         collectVeranaTrust(
-                            certificates = response.veranaCertificates,
-                            vct = null,
+                            VeranaTrustRequest(
+                                certificates = response.veranaCertificates,
+                                vct = response.veranaVct,
+                                partyName = response.relyingParty.name,
+                                credentialName = null,
+                                relyingPartyIsFullyVerified = response.relyingParty.isFullyVerified,
+                            )
                         )
                     }
                 }
@@ -248,37 +247,40 @@ class PresentationRequestViewModel(
         getOrNullKoinScope(viewState.value.presentationScopeId)?.close()
     }
 
-    private fun collectVeranaTrust(certificates: List<X509Certificate>, vct: String?) {
+    override fun retryVeranaTrust() {
+        veranaTrustRequest?.let(::collectVeranaTrust)
+    }
+
+    private fun collectVeranaTrust(request: VeranaTrustRequest) {
+        veranaTrustRequest = request
         veranaTrustJob?.cancel()
         veranaTrustJob = viewModelScope.launch {
-            veranaTrustController.verifierTrust(certificates, vct).collect { trust ->
+            veranaTrustController.verifierTrust(request.certificates, request.vct).collect { trust ->
                 setState {
                     copy(
                         veranaTrust = trust,
-                        headerConfig = headerConfig.copy(
-                            veranaTrustCard = trust.toCardUi(asksFor = true, credentialName = veranaCredentialName),
-                            // The wallet's own tick means "reader auth chained to something"; left
-                            // alone it puts a green check beside a service the registry refuses.
-                            relyingPartyData = headerConfig.relyingPartyData?.copy(
-                                isVerified = trust.verdict == VeranaVerdict.TRUSTED,
-                            ),
+                        veranaTrustCard = trust.toCardUi(
+                            partyName = request.partyName,
+                            credentialName = request.credentialName,
                         ),
+                        relyingPartyHeader = relyingPartyHeader?.let { header ->
+                            header.copy(
+                                relyingParty = header.relyingParty.copy(
+                                    isVerified = request.relyingPartyIsFullyVerified && !trust.blocksAction,
+                                ),
+                            )
+                        },
                     )
                 }
             }
         }
     }
-
-    private fun getRelyingPartyData(
-        name: String?,
-        isVerified: Boolean,
-    ): RelyingPartyDataUi {
-        return RelyingPartyDataUi(
-            isVerified = isVerified,
-            name = name.ifEmptyOrNull(
-                default = resourceProvider.getString(R.string.request_relying_party_default_name)
-            ),
-            description = resourceProvider.getString(R.string.request_relying_party_description),
-        )
-    }
 }
+
+private data class VeranaTrustRequest(
+    val certificates: List<X509Certificate>,
+    val vct: String?,
+    val partyName: String?,
+    val credentialName: String?,
+    val relyingPartyIsFullyVerified: Boolean,
+)

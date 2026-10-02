@@ -25,9 +25,11 @@ import eu.europa.ec.commonfeature.config.SuccessUIConfig
 import eu.europa.ec.commonfeature.interactor.DeviceAuthenticationInteractor
 import eu.europa.ec.corelogic.controller.IssueDocumentsPartialState
 import eu.europa.ec.corelogic.controller.ResolveDocumentOfferPartialState
+import eu.europa.ec.corelogic.controller.VeranaTrustController
 import eu.europa.ec.corelogic.controller.WalletCoreDocumentsController
 import eu.europa.ec.corelogic.extension.getIssuerName
 import eu.europa.ec.corelogic.model.FormatType
+import eu.europa.ec.corelogic.model.UntrustedIssuerReasonDomain
 import eu.europa.ec.eudi.openid4vci.CredentialConfigurationIdentifier
 import eu.europa.ec.eudi.openid4vci.CredentialIssuerEndpoint
 import eu.europa.ec.eudi.openid4vci.CredentialIssuerId
@@ -57,7 +59,6 @@ import eu.europa.ec.issuancefeature.util.mockedTxCodeFourDigits
 import eu.europa.ec.issuancefeature.util.mockedWalletActivationErrorMessage
 import eu.europa.ec.resourceslogic.R
 import eu.europa.ec.resourceslogic.provider.ResourceProvider
-import eu.europa.ec.resourceslogic.theme.values.ThemeColors
 import eu.europa.ec.testfeature.util.getMockedMainPid
 import eu.europa.ec.testfeature.util.mockedDefaultLocale
 import eu.europa.ec.testfeature.util.mockedExceptionWithMessage
@@ -72,15 +73,18 @@ import eu.europa.ec.testfeature.util.mockedNotifyOnAuthenticationFailure
 import eu.europa.ec.testfeature.util.mockedPidId
 import eu.europa.ec.testfeature.util.mockedPlainFailureMessage
 import eu.europa.ec.testfeature.util.mockedUriPath1
+import eu.europa.ec.testfeature.util.mockedVerifiedIssuerRegistration
 import eu.europa.ec.testfeature.util.securePin
 import eu.europa.ec.testlogic.extension.runFlowTest
 import eu.europa.ec.testlogic.extension.runTest
 import eu.europa.ec.testlogic.extension.toFlow
 import eu.europa.ec.testlogic.rule.CoroutineTestRule
 import eu.europa.ec.uilogic.component.AppIcons
+import eu.europa.ec.uilogic.component.ThemeColorKey
 import eu.europa.ec.uilogic.component.utils.PERCENTAGE_25
 import eu.europa.ec.uilogic.serializer.UiSerializer
 import junit.framework.TestCase.assertEquals
+import kotlinx.coroutines.flow.MutableStateFlow
 import org.junit.After
 import org.junit.Before
 import org.junit.Rule
@@ -88,6 +92,7 @@ import org.junit.Test
 import org.mockito.Mock
 import org.mockito.Mockito.mock
 import org.mockito.MockitoAnnotations
+import org.mockito.kotlin.inOrder
 import org.mockito.kotlin.times
 import org.mockito.kotlin.verify
 import org.mockito.kotlin.whenever
@@ -115,6 +120,9 @@ class TestDocumentOfferInteractor {
     private lateinit var configLogic: ConfigLogic
 
     @Mock
+    private lateinit var veranaTrustController: VeranaTrustController
+
+    @Mock
     private lateinit var resultHandler: DeviceAuthenticationResult
 
     @Mock
@@ -126,6 +134,7 @@ class TestDocumentOfferInteractor {
 
     private lateinit var biometricCrypto: BiometricCrypto
 
+
     @Before
     fun before() {
         closeable = MockitoAnnotations.openMocks(this)
@@ -135,13 +144,15 @@ class TestDocumentOfferInteractor {
             deviceAuthenticationInteractor = deviceAuthenticationInteractor,
             resourceProvider = resourceProvider,
             uiSerializer = uiSerializer,
-            configLogic = configLogic
+            configLogic = configLogic,
+            veranaTrustController = veranaTrustController
         )
         biometricCrypto = BiometricCrypto(cryptoObject = null)
 
         whenever(resourceProvider.genericErrorMessage()).thenReturn(mockedGenericErrorMessage)
         whenever(resourceProvider.getLocale()).thenReturn(mockedDefaultLocale)
         whenever(configLogic.forcePidActivation).thenReturn(true)
+        whenever(veranaTrustController.latestIssuerState).thenReturn(MutableStateFlow(null))
     }
 
     @After
@@ -171,7 +182,8 @@ class TestDocumentOfferInteractor {
             )
             mockWalletDocumentsControllerResolveOfferEventEmission(
                 event = ResolveDocumentOfferPartialState.Success(
-                    offer = mockedOffer
+                    offer = mockedOffer,
+                    issuerRegistration = mockedVerifiedIssuerRegistration,
                 )
             )
 
@@ -180,9 +192,32 @@ class TestDocumentOfferInteractor {
                 val expectedResult = ResolveDocumentOfferInteractorPartialState.NoDocument(
                     issuerName = mockedOffer.getIssuerName(mockedDefaultLocale),
                     issuerLogo = null,
+                    issuerRegistration = mockedVerifiedIssuerRegistration,
                 )
                 // Then
                 assertEquals(expectedResult, awaitItem())
+            }
+        }
+
+    @Test
+    fun `Given a registration-refused issuer, When resolveDocumentOffer is called, Then IssuerNotTrusted with that reason is returned`() =
+        coroutineRule.runTest {
+            // Given
+            mockWalletDocumentsControllerResolveOfferEventEmission(
+                event = ResolveDocumentOfferPartialState.IssuerNotTrusted(
+                    reason = UntrustedIssuerReasonDomain.REGISTRATION_CERTIFICATE,
+                )
+            )
+
+            // When
+            interactor.resolveDocumentOffer(mockedUriPath1).runFlowTest {
+                // Then
+                assertEquals(
+                    ResolveDocumentOfferInteractorPartialState.IssuerNotTrusted(
+                        reason = UntrustedIssuerReasonDomain.REGISTRATION_CERTIFICATE,
+                    ),
+                    awaitItem(),
+                )
             }
         }
 
@@ -220,7 +255,10 @@ class TestDocumentOfferInteractor {
             ).thenReturn(mockedInvalidCodeFormatMessage)
 
             mockWalletDocumentsControllerResolveOfferEventEmission(
-                event = ResolveDocumentOfferPartialState.Success(mockedOffer)
+                event = ResolveDocumentOfferPartialState.Success(
+                    offer = mockedOffer,
+                    issuerRegistration = mockedVerifiedIssuerRegistration,
+                )
             )
 
             // When
@@ -267,7 +305,10 @@ class TestDocumentOfferInteractor {
             ).thenReturn(mockedInvalidCodeFormatMessage)
 
             mockWalletDocumentsControllerResolveOfferEventEmission(
-                event = ResolveDocumentOfferPartialState.Success(mockedOffer)
+                event = ResolveDocumentOfferPartialState.Success(
+                    offer = mockedOffer,
+                    issuerRegistration = mockedVerifiedIssuerRegistration,
+                )
             )
 
             // When
@@ -318,7 +359,10 @@ class TestDocumentOfferInteractor {
                 mainPid = mockedMainPid
             )
             mockWalletDocumentsControllerResolveOfferEventEmission(
-                event = ResolveDocumentOfferPartialState.Success(mockedOffer)
+                event = ResolveDocumentOfferPartialState.Success(
+                    offer = mockedOffer,
+                    issuerRegistration = mockedVerifiedIssuerRegistration,
+                )
             )
 
             // When
@@ -333,6 +377,8 @@ class TestDocumentOfferInteractor {
                     issuerName = mockedIssuerName,
                     txCodeLength = mockedTxCodeFourDigits,
                     issuerLogo = null,
+                    issuerRegistration = mockedVerifiedIssuerRegistration,
+                    veranaIssuerUrl = mockHttpUrl,
                 )
                 // Then
                 assertEquals(expectedResult, awaitItem())
@@ -372,7 +418,10 @@ class TestDocumentOfferInteractor {
             )
 
             mockWalletDocumentsControllerResolveOfferEventEmission(
-                event = ResolveDocumentOfferPartialState.Success(mockedOffer)
+                event = ResolveDocumentOfferPartialState.Success(
+                    offer = mockedOffer,
+                    issuerRegistration = mockedVerifiedIssuerRegistration,
+                )
             )
 
             // When
@@ -387,6 +436,8 @@ class TestDocumentOfferInteractor {
                     issuerName = mockedIssuerName,
                     txCodeLength = mockedOffer.txCodeSpec?.length,
                     issuerLogo = null,
+                    issuerRegistration = mockedVerifiedIssuerRegistration,
+                    veranaIssuerUrl = mockHttpUrl,
                 )
 
                 // Then
@@ -422,7 +473,10 @@ class TestDocumentOfferInteractor {
             whenever(resourceProvider.getString(R.string.issuance_document_offer_error_missing_pid_text))
                 .thenReturn(mockedWalletActivationErrorMessage)
             mockWalletDocumentsControllerResolveOfferEventEmission(
-                event = ResolveDocumentOfferPartialState.Success(mockedOffer)
+                event = ResolveDocumentOfferPartialState.Success(
+                    offer = mockedOffer,
+                    issuerRegistration = mockedVerifiedIssuerRegistration,
+                )
             )
 
             // When
@@ -525,7 +579,10 @@ class TestDocumentOfferInteractor {
             )
             mockGetMainPidDocumentCall(mainPid = getMockedMainPid())
             mockWalletDocumentsControllerResolveOfferEventEmission(
-                event = ResolveDocumentOfferPartialState.Success(mockedOffer)
+                event = ResolveDocumentOfferPartialState.Success(
+                    offer = mockedOffer,
+                    issuerRegistration = mockedVerifiedIssuerRegistration,
+                )
             )
 
             // When
@@ -562,7 +619,10 @@ class TestDocumentOfferInteractor {
                 )
             ).thenReturn(mockedInvalidCodeFormatMessage)
             mockWalletDocumentsControllerResolveOfferEventEmission(
-                event = ResolveDocumentOfferPartialState.Success(mockedOffer)
+                event = ResolveDocumentOfferPartialState.Success(
+                    offer = mockedOffer,
+                    issuerRegistration = mockedVerifiedIssuerRegistration,
+                )
             )
 
             // When
@@ -601,7 +661,10 @@ class TestDocumentOfferInteractor {
                 )
             ).thenReturn(mockedInvalidCodeFormatMessage)
             mockWalletDocumentsControllerResolveOfferEventEmission(
-                event = ResolveDocumentOfferPartialState.Success(mockedOffer)
+                event = ResolveDocumentOfferPartialState.Success(
+                    offer = mockedOffer,
+                    issuerRegistration = mockedVerifiedIssuerRegistration,
+                )
             )
 
             // When
@@ -618,23 +681,27 @@ class TestDocumentOfferInteractor {
 
     // Case 14:
     // 1. walletCoreDocumentsController.resolveDocumentOffer emits
-    // ResolveDocumentOfferPartialState.IssuerNotTrusted.
+    // ResolveDocumentOfferPartialState.IssuerNotTrusted refused by the access certificate.
 
     // Case 14 Expected Result:
-    // ResolveDocumentOfferInteractorPartialState.IssuerNotTrusted
+    // ResolveDocumentOfferInteractorPartialState.IssuerNotTrusted carrying that reason
     @Test
     fun `Given Case 14, When resolveDocumentOffer is called, Then Case 14 Expected Result is returned`() =
         coroutineRule.runTest {
             // Given
             mockWalletDocumentsControllerResolveOfferEventEmission(
-                event = ResolveDocumentOfferPartialState.IssuerNotTrusted
+                event = ResolveDocumentOfferPartialState.IssuerNotTrusted(
+                    reason = UntrustedIssuerReasonDomain.ACCESS_CERTIFICATE,
+                )
             )
 
             // When
             interactor.resolveDocumentOffer(mockedUriPath1).runFlowTest {
                 // Then
                 assertEquals(
-                    ResolveDocumentOfferInteractorPartialState.IssuerNotTrusted,
+                    ResolveDocumentOfferInteractorPartialState.IssuerNotTrusted(
+                        reason = UntrustedIssuerReasonDomain.ACCESS_CERTIFICATE,
+                    ),
                     awaitItem()
                 )
             }
@@ -793,8 +860,8 @@ class TestDocumentOfferInteractor {
     // IssueDocumentsPartialState.DeferredSuccess with:
     // mocked deferred documents
     // 2. required strings are mocked
-    // 3. triple object with warning tint color
-    // 4. uiSerializer.toBase64() serializes the mockedSuccessUiConfig into mockedRouteArguments
+    // 3. triple object with pending text color and primary image tint
+    // 4. uiSerializer.toBase64() serializes the deferred-success config into mockedRouteArguments
 
     // Case 5 Expected Result:
     // IssueDocumentsInteractorPartialState.DeferredSuccess state, with:
@@ -822,11 +889,11 @@ class TestDocumentOfferInteractor {
                 first = SuccessUIConfig.TextElementsConfig(
                     text = mockedSuccessText,
                     description = mockedSuccessDescription,
-                    color = ThemeColors.pending
+                    color = ThemeColorKey.Pending
                 ),
                 second = SuccessUIConfig.ImageConfig(
                     type = SuccessUIConfig.ImageConfig.Type.Drawable(icon = AppIcons.InProgress),
-                    tint = ThemeColors.primary,
+                    tint = ThemeColorKey.Primary,
                     screenPercentageSize = PERCENTAGE_25,
                 ),
                 third = resourceProvider.getString(R.string.issuance_document_offer_deferred_success_primary_button_text)
@@ -1089,17 +1156,19 @@ class TestDocumentOfferInteractor {
 
     // Case 11:
     // 1. walletCoreDocumentsController.issueDocumentsByOffer emits
-    // IssueDocumentsPartialState.IssuerNotTrusted.
+    // IssueDocumentsPartialState.IssuerNotTrusted refused by the access certificate.
 
     // Case 11 Expected Result:
-    // IssueDocumentsInteractorPartialState.IssuerNotTrusted
+    // IssueDocumentsInteractorPartialState.IssuerNotTrusted carrying that reason
     @Test
     fun `Given Case 11, When issueDocuments is called, Then Case 11 Expected Result is returned`() =
         coroutineRule.runTest {
             // Given
             mockWalletDocumentsControllerIssueByUriEventEmission(
                 offerUri = mockedUriPath1,
-                event = IssueDocumentsPartialState.IssuerNotTrusted
+                event = IssueDocumentsPartialState.IssuerNotTrusted(
+                    reason = UntrustedIssuerReasonDomain.ACCESS_CERTIFICATE
+                )
             )
 
             // When
@@ -1111,7 +1180,9 @@ class TestDocumentOfferInteractor {
             ).runFlowTest {
                 // Then
                 assertEquals(
-                    IssueDocumentsInteractorPartialState.IssuerNotTrusted,
+                    IssueDocumentsInteractorPartialState.IssuerNotTrusted(
+                        reason = UntrustedIssuerReasonDomain.ACCESS_CERTIFICATE
+                    ),
                     awaitItem()
                 )
             }
@@ -1149,6 +1220,42 @@ class TestDocumentOfferInteractor {
                 assertEquals(
                     IssueDocumentsInteractorPartialState.PartialSuccessWithUntrustedIssuer(
                         issuedDocumentIds = listOf(mockedMdlId)
+                    ),
+                    awaitItem()
+                )
+            }
+        }
+
+    // Case 13:
+    // 1. walletCoreDocumentsController.issueDocumentsByOffer emits
+    //    IssueDocumentsPartialState.IssuerNotTrusted refused by the registration certificate.
+    //    The resolve-time gate refuses first; the offer flow never re-checks, so this
+    //    covers Wallet Core raising the refusal during issuance instead.
+
+    // Case 13 Expected Result:
+    // IssueDocumentsInteractorPartialState.IssuerNotTrusted carrying the registration reason.
+    @Test
+    fun `Given Case 13, When issueDocuments is called, Then Case 13 Expected Result is returned`() =
+        coroutineRule.runTest {
+            // Given
+            mockWalletDocumentsControllerIssueByUriEventEmission(
+                offerUri = mockedUriPath1,
+                event = IssueDocumentsPartialState.IssuerNotTrusted(
+                    reason = UntrustedIssuerReasonDomain.REGISTRATION_CERTIFICATE
+                )
+            )
+
+            // When
+            interactor.issueDocuments(
+                offerUri = mockedUriPath1,
+                issuerName = mockedIssuerName,
+                navigation = mockedConfigNavigationTypePop,
+                txCode = securePin(mockedTxCode)
+            ).runFlowTest {
+                // Then
+                assertEquals(
+                    IssueDocumentsInteractorPartialState.IssuerNotTrusted(
+                        reason = UntrustedIssuerReasonDomain.REGISTRATION_CERTIFICATE
                     ),
                     awaitItem()
                 )
@@ -1194,13 +1301,15 @@ class TestDocumentOfferInteractor {
     // BiometricsAvailability.NonEnrolled
 
     // Case 2 Expected Result:
-    // deviceAuthenticationInteractor.launchBiometricSystemScreen called once.
+    // End the pending request before opening enrollment so the user can retry afterwards.
     @Test
     fun `Given Case 2, When handleUserAuthentication is called, Then Case 2 expected result is returned`() {
         // Given
         mockBiometricsAvailabilityResponse(
             response = BiometricsAvailability.NonEnrolled
         )
+        val onError = mock<() -> Unit>()
+        val resultHandler = DeviceAuthenticationResult(onAuthenticationError = onError)
 
         // When
         interactor.handleUserAuthentication(
@@ -1211,8 +1320,11 @@ class TestDocumentOfferInteractor {
         )
 
         // Then
-        verify(deviceAuthenticationInteractor, times(1))
-            .launchBiometricSystemScreen()
+        inOrder(onError, deviceAuthenticationInteractor) {
+            verify(onError).invoke()
+            verify(deviceAuthenticationInteractor).launchBiometricSystemScreen(biometricCrypto)
+            verifyNoMoreInteractions()
+        }
     }
 
     // Case 3:
@@ -1220,13 +1332,13 @@ class TestDocumentOfferInteractor {
     // BiometricsAvailability.Failure
 
     // Case 3 Expected Result:
-    // resultHandler.onAuthenticationFailure called once.
+    // resultHandler.onAuthenticationError called once, even when the scan-failure callback is omitted.
     @Test
     fun `Given Case 3, When handleUserAuthentication is called, Then Case 3 expected result is returned`() {
         // Given
-        val onFailure = mock<() -> Unit>()
+        val onError = mock<() -> Unit>()
         val resultHandler = DeviceAuthenticationResult(
-            onAuthenticationFailure = onFailure
+            onAuthenticationError = onError
         )
 
         mockBiometricsAvailabilityResponse(
@@ -1244,7 +1356,7 @@ class TestDocumentOfferInteractor {
         )
 
         // Then
-        verify(onFailure).invoke()
+        verify(onError).invoke()
     }
 
     //endregion
@@ -1288,7 +1400,9 @@ class TestDocumentOfferInteractor {
     }
 
     private fun mockBiometricsAvailabilityResponse(response: BiometricsAvailability) {
-        whenever(deviceAuthenticationInteractor.getBiometricsAvailability()).thenReturn(response)
+        whenever(deviceAuthenticationInteractor.getBiometricsAvailability(biometricCrypto)).thenReturn(
+            response
+        )
     }
 
     private fun mockDeferredDocumentsMap(): Map<String, String> {
@@ -1393,7 +1507,7 @@ class TestDocumentOfferInteractor {
             first = SuccessUIConfig.TextElementsConfig(
                 text = mockedSuccessText,
                 description = mockedSuccessDescription,
-                color = ThemeColors.success
+                color = ThemeColorKey.Success
             ),
             second = SuccessUIConfig.ImageConfig(),
             third = mockedPrimaryButtonText
